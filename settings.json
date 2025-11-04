@@ -1,7 +1,6 @@
 {
   "enabledPlugins": {
-    "claude-builder@bbrowning-marketplace": true,
-    "pr-review@bbrowning-marketplace": true
+    "bbrowning-claude@bbrowning-marketplace": true
   },
   "alwaysThinkingEnabled": true
 }
