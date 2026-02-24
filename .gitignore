@@ -1,9 +1,14 @@
 # Session data and logs
+backups/
+cache/
 debug/
 file-history/
 history.jsonl
+paste-cache/
+plans/
 session-env/
 shell-snapshots/
+tasks/
 todos/
 
 # Project-specific cache
@@ -11,13 +16,10 @@ projects/
 
 # Analytics and telemetry
 statsig/
+stats-cache.json
 
-# Plugin metadata (machine-specific paths and timestamps)
-plugins/installed_plugins.json
-plugins/known_marketplaces.json
-plugins/config.json
-plugins/marketplaces/
-plugins/repos/
+# Plugins
+plugins/
 
 # Any log files
 *.log
