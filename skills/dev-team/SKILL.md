@@ -150,7 +150,9 @@ Then ask: "Ready to proceed, or adjust?"
 
 ### Step 1: Create the Team
 
-Use `TeamCreate` to create a named team:
+First, call `TeamDelete` to clean up any existing team from a previous run (e.g., after `/clear`). Ignore any errors if no team exists.
+
+Then create the new team:
 ```
 TeamCreate(team_name: "descriptive-name", description: "What this team is doing")
 ```
