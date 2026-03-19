@@ -10,6 +10,8 @@ session-env/
 shell-snapshots/
 tasks/
 todos/
+.credentials.json
+mcp-needs-auth-cache.json
 
 # Project-specific cache
 projects/
@@ -32,3 +34,8 @@ plugins/
 # OS-specific files
 .DS_Store
 Thumbs.db
+.update.lock
+
+# IDE specific files
+ide/
+
