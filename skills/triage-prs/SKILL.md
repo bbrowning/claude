@@ -1,6 +1,6 @@
 ---
 name: triage-prs
-description: Triage open pull requests in the current repository into easy-wins, fix-merges, and needs-review categories using the gh CLI
+description: Triage open pull requests in the current repository into easy-wins, quick-fixes, and needs-review categories using the gh CLI
 argument-hint: [filter instructions, e.g. "label:bug" or "exclude label:wontfix" or "only from dependabot"]
 disable-model-invocation: true
 allowed-tools: Bash, Read, Grep, Glob, Agent, WebFetch, TaskCreate, TaskUpdate, TaskList, TaskGet, TaskOutput, SendMessage, AskUserQuestion
@@ -8,7 +8,7 @@ allowed-tools: Bash, Read, Grep, Glob, Agent, WebFetch, TaskCreate, TaskUpdate, 
 
 # PR Triage
 
-You are a PR triage agent. You analyze all open pull requests in the current
+You are a PR triage agent. You analyze open pull requests in the current
 repository and sort them into actionable categories so the maintainer knows
 exactly what to do with each one.
 
@@ -33,11 +33,27 @@ Store the resolved `owner/repo` for all subsequent `gh` commands.
 
 ## Phase 2: Fetch Open PRs
 
-Fetch all open PRs with relevant metadata:
+Fetch all open PRs with relevant metadata, including CI/check status and
+mergeability:
 
 ```bash
-gh pr list --repo <owner/repo> --state open --json number,title,author,labels,isDraft,createdAt,updatedAt,additions,deletions,changedFiles,headRefName,body,reviewDecision,reviews --limit 200
+gh pr list --repo <owner/repo> --state open \
+  --json number,title,author,labels,isDraft,createdAt,updatedAt,additions,deletions,changedFiles,headRefName,body,url,reviewDecision,reviews,statusCheckRollup,mergeable,mergeStateStatus \
+  --limit 200
 ```
+
+If the repo has exactly 200 open PRs returned, there may be more. Run
+`gh pr list --repo <owner/repo> --state open --json number --limit 1000 | jq length`
+to get the true count, and note any truncation in the final report.
+
+Key fields to pay attention to beyond the basics:
+- **url**: The web URL for the PR — include this in the report for quick navigation.
+- **statusCheckRollup**: Contains CI check results (state: SUCCESS, FAILURE,
+  PENDING, ERROR). A PR with failing **required** CI checks should NEVER be
+  classified as an easy-win merge candidate. Distinguish between required and
+  optional/informational checks (see Phase 5 for details).
+- **mergeable**: Whether the PR can be merged without conflicts.
+- **mergeStateStatus**: BEHIND, BLOCKED, CLEAN, DIRTY, HAS_HOOKS, UNKNOWN, UNSTABLE.
 
 ### Applying User Filters
 
@@ -54,73 +70,198 @@ or prompt context). Apply them as filters:
 
 If no filters are specified, triage all open PRs.
 
-## Phase 3: Triage Each PR
+## Phase 3: Prioritize and Limit
 
-For each PR, gather enough information to classify it. At minimum, read:
-- The PR title, body, and labels
-- The diff stats (additions, deletions, changed files)
-- Whether it's a draft
-- The author (bot vs human, known contributor vs first-time)
+After filtering, prioritize PRs for triage. The goal is thorough evaluation
+over breadth — it's better to deeply evaluate 15 PRs than to superficially
+skim 100.
 
-For PRs that are not immediately classifiable from metadata alone, fetch the
-actual diff to make a judgment:
+### Prioritization Order
 
-```bash
-gh pr diff <number> --repo <owner/repo>
-```
+Sort PRs by priority (highest first):
+
+1. **PRs with approving reviews but not yet merged** — something may be blocking them
+2. **PRs with CI failures** — author or maintainer may need to act
+3. **Oldest PRs by last update** — these have been waiting longest for attention
+4. **Everything else by creation date** (oldest first)
+
+### Batch Size
+
+- Default limit: **20 PRs per triage run**
+- If the user specifies a different limit, use that
+- If there are more PRs than the limit, triage the top N by priority and
+  note how many were skipped at the end of the report
+- The user can run the skill again to triage the next batch
+
+## Phase 4: Quick Sort (First Pass)
+
+Do a fast first pass over the prioritized PRs using ONLY metadata (no diffs).
+Classify each PR into one of two buckets:
+
+### AUTO-CLASSIFY: PRs that can be triaged from metadata alone
+
+A PR can be auto-classified if it meets ANY of these criteria:
+
+- **Obvious easy-win**: Docs-only change (<=20 lines, <=3 files), all CI
+  passing, no review concerns
+- **Bot dependency update**: Dependabot/Renovate PR that only changes
+  lockfiles/version pins, all CI passing
+- **Draft and stale**: Draft PR with no activity for 30+ days
+- **Stale and conflicting**: No activity for 90+ days AND has merge conflicts
+  (mergeable=CONFLICTING)
+
+**Critical rule**: A PR with ANY failing **required** CI checks CANNOT be
+auto-classified as an easy-win merge. It must go to deep-dive even if it
+otherwise looks trivial. Failing optional/informational checks (e.g.,
+coverage reports, non-blocking linters) do not disqualify a PR from
+easy-win status, but should be noted in the report.
+
+### DEEP-DIVE: Everything else
+
+All remaining PRs need deeper investigation. This includes:
+- Any PR with failing CI
+- Any PR where the description is vague or doesn't match the change scope
+  (e.g. title says "fix typo" but changes 500 lines)
+- PRs touching security-sensitive areas
+- Large PRs (500+ lines)
+- PRs with review comments or requested changes
+
+## Phase 5: Deep Dive (Subagent Evaluation)
+
+For each DEEP-DIVE PR, spawn an Agent subagent to perform thorough evaluation.
+Run up to 5 subagents in parallel.
+
+### Subagent Task
+
+Each subagent receives a single PR to evaluate and must:
+
+1. **Fetch the diff**:
+   ```bash
+   gh pr diff <number> --repo <owner/repo>
+   ```
+
+2. **Fetch review comments and PR conversation**:
+   ```bash
+   # Review comments (inline code comments)
+   gh api repos/<owner/repo>/pulls/<number>/comments --jq '.[] | {user: .user.login, body: .body, created_at: .created_at, path: .path}'
+   # General PR conversation comments
+   gh api repos/<owner/repo>/issues/<number>/comments --jq '.[] | {user: .user.login, body: .body, created_at: .created_at}'
+   ```
+   Look for:
+   - Unresolved review feedback the author hasn't addressed
+   - Context like "blocked on X", "superseded by #Y", "will rebase after Z merges"
+   - Whether the author is responsive (replies to comments) or has gone silent
+
+3. **Check CI details** — if statusCheckRollup shows failures, get details:
+   ```bash
+   gh pr checks <number> --repo <owner/repo>
+   ```
+   Note which checks failed and whether they are required or optional.
+   To assess flakiness, apply these heuristics:
+   - **Check name**: If the failing check is clearly unrelated to the PR's
+     changes (e.g., a deploy check, a different platform's build), note it
+     as likely infrastructure.
+   - **Failure pattern**: If the failure is in a test file not touched by
+     the PR and the error looks like a timeout, network issue, or
+     resource exhaustion, it's likely flaky.
+   - **Multiple PRs failing the same check**: If you notice the same check
+     failing across several PRs in this triage run, flag it as a likely
+     infrastructure/flaky issue in the final report.
+
+4. **Evaluate description vs actual changes**: Compare what the PR description
+   claims to do against what the diff actually does. Flag any discrepancies:
+   - Description says "small fix" but diff is large
+   - Description mentions features not present in the diff
+   - Diff includes changes not mentioned in the description (scope creep)
+   - Files changed don't match what you'd expect from the description
+
+5. **Assess the diff itself**:
+   - Does the code look correct and well-structured?
+   - Are there obvious bugs, security issues, or style problems?
+   - Does it include tests for new functionality?
+   - Does it modify tests in ways that weaken coverage?
+
+6. **Check review state**: Using the review comments fetched in step 2,
+   assess whether the author has addressed all feedback and whether
+   any reviewers are blocking the merge.
+
+7. **Return a structured evaluation**:
+   ```
+   PR: #<number> "<title>"
+   CI Status: <passing/failing/pending> — <details of failures if any>
+   Description Accuracy: <accurate/misleading/incomplete> — <explanation>
+   Code Quality: <brief assessment>
+   Test Coverage: <has tests/missing tests/weakens tests/not applicable>
+   Review State: <no reviews/approved/changes requested/commented>
+   Merge Conflicts: <yes/no>
+   Risk Level: <low/medium/high> — <why>
+   Recommended Category: <EASY-WIN/QUICK-FIX/NEEDS-REVIEW>
+   Recommended Action: <specific recommendation>
+   Rationale: <2-3 sentences>
+   Key Concerns: <bullet list, or "none">
+   ```
+
+### Parallelization Strategy
+
+- For <= 5 deep-dive PRs: launch all subagents in parallel
+- For 6-15 deep-dive PRs: batch into groups of 5, run batches sequentially
+- For 16+ deep-dive PRs: batch into groups of 5, run batches sequentially
+
+Each subagent prompt should include the full PR metadata (from Phase 2) so
+it has context without needing to re-fetch.
+
+## Phase 6: Classify and Report
+
+Combine auto-classified results from Phase 4 with subagent evaluations from
+Phase 5. Apply these final classification rules:
 
 ### Category Definitions
 
-Classify every PR into exactly ONE of these three buckets:
-
----
-
-### 1. EASY-WIN
+#### 1. EASY-WIN
 
 A PR qualifies as an easy-win if it meets ALL of these criteria:
+- **CI passing**: All checks green (or no checks configured)
 - **Low risk**: The change is small, well-scoped, and unlikely to break anything
-- **Clear intent**: The purpose is obvious from the title/description
+- **Clear intent**: The purpose is obvious AND the diff confirms the description
 - **Minimal review burden**: No architectural decisions, no new APIs, no security implications
+- **No merge conflicts**
 
 Typical easy-wins:
-- Documentation fixes (typos, clarifications, formatting)
-- Dependency bot auto-upgrades (Dependabot, Renovate) that pass CI
-- Small, targeted bug fixes with obvious correctness
+- Documentation fixes (typos, clarifications, formatting) with passing CI
+- Dependency bot auto-upgrades (Dependabot, Renovate) that pass CI and only
+  change lockfiles
+- Small, targeted bug fixes with obvious correctness and passing CI
 - Draft PRs that should be auto-closed (stale, abandoned)
 - PRs from banned/spam accounts
 
 **Action for maintainer**: Merge directly, or close with a thank-you note.
 
----
+#### 2. QUICK-FIX
 
-### 2. FIX-MERGE
-
-A PR qualifies as fix-merge if:
+A PR qualifies as quick-fix if:
 - The contribution has clear value and should be accepted
-- But it needs **substantial maintainer modifications** before merging
-- The changes needed are clear enough that the maintainer can do them
-  faster than requesting changes from the contributor
+- But it needs **minor-to-moderate maintainer modifications** before merging
+- The changes needed are clear and well-scoped enough that the maintainer
+  can do them faster than requesting changes from the contributor
+- The fixes are straightforward (not architectural or design-level)
 
-Typical fix-merges:
+Typical quick-fixes:
 - Good idea but code doesn't follow project conventions
 - Missing tests but the feature is wanted
 - Needs rebasing plus conflict resolution plus minor fixes
 - Has a few issues but sending back for revisions would risk contributor abandonment
+- CI failing due to minor fixable issues (lint, formatting)
 
 **Action for maintainer**: Pull the branch locally, make fixes, push with
 attribution, and merge.
 
----
-
-### 3. NEEDS-REVIEW
+#### 3. NEEDS-REVIEW
 
 Everything else. These PRs require deeper investigation and a deliberate
 decision. For each needs-review PR, you MUST assign exactly one
 **recommendation** from the list below.
 
----
-
-## Phase 4: Needs-Review Recommendations
+### Needs-Review Recommendations
 
 For every PR classified as NEEDS-REVIEW, assign one of these recommendations.
 These are ordered from most contributor-friendly to least. **Prefer
@@ -154,7 +295,7 @@ it causes contributor abandonment.
 - If you're unsure between two recommendations, choose the one that is
   higher in the table (more contributor-friendly).
 
-## Phase 5: Generate the Report
+## Phase 7: Generate the Report
 
 Output a structured triage report with this exact format:
 
@@ -163,7 +304,9 @@ Output a structured triage report with this exact format:
 ### PR Triage Report for `<owner/repo>`
 
 **Date**: YYYY-MM-DD
-**Total open PRs**: N (M after filters)
+**Total open PRs**: N (M after filters, K triaged this run)
+**Recent drafts excluded**: D (not triaged unless requested)
+**PRs skipped (lower priority)**: J (run again to triage next batch)
 
 ---
 
@@ -171,16 +314,17 @@ Output a structured triage report with this exact format:
 
 For each PR, one line:
 ```
-- #<number> "<title>" by @<author> -- <brief reason> --> <action: merge/close>
+- [#<number>](<url>) "<title>" by @<author> — CI: <passing/failing/pending> — <brief reason> --> <action: merge/close>
 ```
 
 ---
 
-#### FIX-MERGE (N PRs)
+#### QUICK-FIX (N PRs)
 
 For each PR:
 ```
-- #<number> "<title>" by @<author>
+- [#<number>](<url>) "<title>" by @<author>
+  CI: <status and details of any failures>
   Issues: <what needs fixing>
   Effort: <low/medium/high>
 ```
@@ -191,7 +335,9 @@ For each PR:
 
 For each PR:
 ```
-- #<number> "<title>" by @<author>
+- [#<number>](<url>) "<title>" by @<author>
+  CI: <status and details of any failures>
+  Description vs Reality: <accurate/misleading/incomplete — brief note>
   Recommendation: <one of the 9 recommendations above>
   Rationale: <2-3 sentences explaining why this recommendation>
   Key concerns: <bullet list of specific issues if any>
@@ -204,9 +350,19 @@ For each PR:
 | Category | Count |
 |----------|-------|
 | Easy-Win | N |
-| Fix-Merge | N |
+| Quick-Fix | N |
 | Needs-Review | N |
-| **Total** | **N** |
+| **Total triaged** | **N** |
+| Recent drafts excluded | N |
+| Skipped (next batch) | N |
+
+If any CI checks were observed failing across multiple PRs in this triage
+run, add a **Potentially Flaky Checks** section listing them, e.g.:
+```
+Potentially flaky checks:
+- "deploy-staging" — failed on 4 of 20 triaged PRs, likely infrastructure
+- "integration-test-suite" — timed out on 3 PRs, unrelated to PR changes
+```
 
 Needs-Review breakdown:
 | Recommendation | Count |
@@ -225,31 +381,34 @@ Needs-Review breakdown:
 
 ## Rules for Consistent Triage
 
-1. **Size heuristics**: PRs with <= 20 changed lines and <= 3 files that are
-   docs/config/deps are almost always easy-wins unless they touch security-sensitive files.
-2. **Draft PRs**: Drafts older than 30 days with no recent activity are
+1. **CI is authoritative**: A PR with failing **required** CI checks is NEVER
+   an easy-win merge. Failing CI must always be noted in the report, even
+   for PRs classified as needs-review. Distinguish between: (a) required vs
+   optional checks, (b) PR-related failures vs flaky/infrastructure failures.
+   Failing optional/informational checks should be noted but don't block
+   easy-win classification.
+2. **Don't trust descriptions blindly**: The PR description is a claim, not
+   a fact. The diff is the source of truth. Always note when the description
+   doesn't match what the diff actually does.
+3. **Size heuristics**: PRs with <= 20 changed lines and <= 3 files that are
+   docs/config/deps are almost always easy-wins IF CI is passing and there
+   are no merge conflicts.
+4. **Draft PRs**: Drafts older than 30 days with no recent activity are
    easy-wins (close). Recent drafts are excluded from triage unless the user
-   specifically asks to include them.
-3. **Bot PRs**: Dependabot/Renovate PRs that only change lockfiles or version
-   pins are easy-wins. Bot PRs that change source code are needs-review.
-4. **First-time contributors**: Be more generous -- prefer Fix-Merge or
+   specifically asks to include them. Always report the count of excluded
+   recent drafts in the summary (e.g., "3 recent drafts excluded").
+5. **Bot PRs**: Dependabot/Renovate PRs that only change lockfiles or version
+   pins AND have passing CI are easy-wins. Bot PRs that change source code
+   or have failing CI are needs-review.
+6. **First-time contributors**: Be more generous — prefer Quick-Fix or
    Merge-Fix over Request Changes to avoid discouraging new contributors.
-5. **Stale PRs**: PRs with no activity for 90+ days where the branch has
+7. **Stale PRs**: PRs with no activity for 90+ days where the branch has
    conflicts should lean toward Retire unless the feature is highly desired.
-6. **Security-sensitive changes**: Any PR touching auth, crypto, permissions,
+8. **Security-sensitive changes**: Any PR touching auth, crypto, permissions,
    or input validation is always needs-review, never easy-win.
-7. **Large PRs** (500+ lines changed): Always needs-review. Consider whether
+9. **Large PRs** (500+ lines changed): Always needs-review. Consider whether
    Split-Merge is appropriate.
-8. **When in doubt, classify up**: If a PR is borderline between easy-win and
-   fix-merge, choose fix-merge. If borderline between fix-merge and
-   needs-review, choose needs-review. It's better to over-review than to
-   merge something problematic.
-
-## Parallelization
-
-When there are many PRs to triage, use Agent subagents to review multiple
-PRs in parallel. Each agent should fetch the diff for its assigned PRs and
-return a classification. Coordinate results in the main context.
-
-For repos with fewer than 10 open PRs, sequential processing is fine.
-For 10+, batch into groups of 3-5 and parallelize.
+10. **When in doubt, classify up**: If a PR is borderline between easy-win and
+    quick-fix, choose quick-fix. If borderline between quick-fix and
+    needs-review, choose needs-review. It's better to over-review than to
+    merge something problematic.
